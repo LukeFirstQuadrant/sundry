@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""
+pcapslice — extract packets from a pcap / pcap.gz within a time window.
+
+Usage:
+    pcapslice -s <start> -e <end> INPUT.pcap[.gz] > target.pcap
+
+Time formats:
+    Absolute : YYMMDD_hhmmss           e.g. 260707_143000
+    Relative : +<n>s | +<n>m | +<n>h   (only for -e, relative to start)
+               may be combined, e.g. +1m30s, +1h30m
+
+Examples:
+    pcapslice -s 260707_143000 -e 260707_143500 cap.pcap.gz > out.pcap
+    pcapslice -s 260707_143000 -e +30s          cap.pcap    > out.pcap
+    pcapslice -s 260707_143000 -e +1h    cap.pcap --utc | tshark -r -
+"""
+
+import argparse
+import calendar
+import gzip
+import re
+import struct
+import sys
+import time
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def parse_abs_time(s, use_utc):
+    """Parse YYMMDD_hhmmss into a float epoch second."""
+    try:
+        tm = time.strptime(s, "%y%m%d_%H%M%S")
+    except ValueError:
+        raise ValueError(
+            f"invalid absolute time {s!r}; expected YYMMDD_hhmmss (e.g. 260707_143000)"
+        )
+    if use_utc:
+        return float(calendar.timegm(tm))
+    return float(time.mktime(tm))
+
+
+_REL_RE = re.compile(r"(\d+)\s*([smhd])", re.IGNORECASE)
+_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_rel_time(s):
+    """Parse +<n>s / +<n>m / +<n>h (combinable) into seconds."""
+    body = s[1:] if s.startswith("+") else s
+    parts = _REL_RE.findall(body)
+    # reject stray characters so typos don't silently parse as 0
+    if not parts or _REL_RE.sub("", body).strip():
+        raise ValueError(
+            f"invalid relative time {s!r}; expected +<n>[smhd], e.g. +30s, +1m, +1h30m"
+        )
+    return sum(int(n) * _UNIT[u.lower()] for n, u in parts)
+
+
+def resolve_times(args):
+    start = parse_abs_time(args.start, args.utc)
+    if args.end.startswith("+"):
+        end = start + parse_rel_time(args.end)
+    else:
+        end = parse_abs_time(args.end, args.utc)
+    if end < start:
+        raise ValueError("end time is before start time")
+    return start, end
+
+
+def open_maybe_gz(path):
+    """Open a file, transparently decompressing gzip (by magic, not extension)."""
+    if path == "-":
+        raw = sys.stdin.buffer
+        head = raw.read(2)
+
+        class _Prepend:
+            def __init__(self, head, rest):
+                self._buf = head
+                self._rest = rest
+
+            def read(self, n=-1):
+                if self._buf:
+                    if n is None or n < 0:
+                        data = self._buf + self._rest.read()
+                        self._buf = b""
+                        return data
+                    take = self._buf[:n]
+                    self._buf = self._buf[len(take):]
+                    if len(take) < n:
+                        take += self._rest.read(n - len(take))
+                    return take
+                return self._rest.read(n)
+
+        stream = _Prepend(head, raw)
+        if head[:2] == b"\x1f\x8b":
+            return gzip.GzipFile(fileobj=stream)
+        return stream
+
+    f = open(path, "rb")
+    magic = f.read(2)
+    f.seek(0)
+    if magic == b"\x1f\x8b":
+        f.close()
+        return gzip.open(path, "rb")
+    return f
+
+
+# libpcap magic numbers -> (endian struct prefix, timestamp divisor)
+PCAP_MAGICS = {
+    0xA1B2C3D4: ("<", 1_000_000),   # little-endian, microsecond
+    0xD4C3B2A1: (">", 1_000_000),   # big-endian, microsecond
+    0xA1B23C4D: ("<", 1_000_000_000),  # little-endian, nanosecond
+    0x4D3CB2A1: (">", 1_000_000_000),  # big-endian, nanosecond
+}
+
+
+def read_exact(fh, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = fh.read(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def read_global_header(fh):
+    global_hdr = read_exact(fh, 24)
+    if len(global_hdr) < 24:
+        raise ValueError("file too short to be a pcap (no global header)")
+    magic = struct.unpack("<I", global_hdr[:4])[0]
+    if magic == 0x0A0D0D0A:  # pcapng section header block
+        raise ValueError(
+            "input looks like pcapng, not classic pcap. "
+            "Convert first, e.g.:  editcap -F libpcap in.pcapng out.pcap"
+        )
+    if magic not in PCAP_MAGICS:
+        raise ValueError(f"unrecognized pcap magic 0x{magic:08x}")
+    endian, tsdiv = PCAP_MAGICS[magic]
+    return global_hdr, endian, tsdiv
+
+
+def info_pcap(fh, use_utc):
+    """Scan the whole capture and report first/last packet times and count."""
+    _, endian, tsdiv = read_global_header(fh)
+    rec_hdr = struct.Struct(endian + "IIII")
+    first = last = None
+    total = 0
+    while True:
+        hdr = read_exact(fh, 16)
+        if not hdr:
+            break
+        if len(hdr) < 16:
+            eprint(f"warning: truncated record header at packet {total}, stopping")
+            break
+        ts_sec, ts_frac, incl_len, orig_len = rec_hdr.unpack(hdr)
+        data = read_exact(fh, incl_len)
+        if len(data) < incl_len:
+            eprint(f"warning: truncated packet data at packet {total}, stopping")
+            break
+        ts = ts_sec + ts_frac / tsdiv
+        if first is None:
+            first = ts
+        last = ts
+        total += 1
+
+    conv = time.gmtime if use_utc else time.localtime
+    zone = "UTC" if use_utc else "local"
+    if total == 0:
+        eprint("pcapslice: capture contains no packets")
+        return 1
+
+    def fmt(t):
+        return time.strftime("%y%m%d_%H%M%S", conv(t)) + f".{int((t % 1) * 1e6):06d}"
+
+    span = last - first
+    eprint(f"packets : {total}")
+    eprint(f"first   : {fmt(first)} ({zone})")
+    eprint(f"last    : {fmt(last)} ({zone})")
+    eprint(f"span    : {span:.3f} s ({span / 60:.2f} min)")
+    return 0
+
+
+def slice_pcap(fh, out, start, end):
+    global_hdr, endian, tsdiv = read_global_header(fh)
+    out.write(global_hdr)
+
+    rec_hdr = struct.Struct(endian + "IIII")
+    matched = 0
+    total = 0
+    while True:
+        hdr = read_exact(fh, 16)
+        if not hdr:
+            break
+        if len(hdr) < 16:
+            eprint(f"warning: truncated record header at packet {total}, stopping")
+            break
+        ts_sec, ts_frac, incl_len, orig_len = rec_hdr.unpack(hdr)
+        data = read_exact(fh, incl_len)
+        if len(data) < incl_len:
+            eprint(f"warning: truncated packet data at packet {total}, stopping")
+            break
+        total += 1
+        ts = ts_sec + ts_frac / tsdiv
+        if ts < start:
+            continue
+        if ts > end:
+            # pcap records are usually time-ordered; bail early once past window
+            break
+        out.write(hdr)
+        out.write(data)
+        matched += 1
+
+    return matched, total
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="pcapslice",
+        description="Extract packets from a pcap/pcap.gz within a time window.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("input", help="input pcap or pcap.gz file ('-' for stdin)")
+    p.add_argument(
+        "-i",
+        "--info",
+        action="store_true",
+        help="just report the capture's first/last packet time and exit",
+    )
+    p.add_argument("-s", "--start", help="start time, YYMMDD_hhmmss")
+    p.add_argument(
+        "-e",
+        "--end",
+        help="end time YYMMDD_hhmmss, or +<n>[smhd] relative to start",
+    )
+    p.add_argument(
+        "--utc",
+        action="store_true",
+        help="interpret given times as UTC (default: local time)",
+    )
+    p.add_argument(
+        "-o",
+        "--output",
+        help="write to file instead of stdout",
+    )
+    args = p.parse_args(argv)
+
+    if not args.info:
+        if not args.start or not args.end:
+            p.error("-s/--start and -e/--end are required (or use -i/--info)")
+        try:
+            start, end = resolve_times(args)
+        except ValueError as e:
+            eprint(f"pcapslice: {e}")
+            return 2
+
+    if args.info:
+        try:
+            fh = open_maybe_gz(args.input)
+        except OSError as e:
+            eprint(f"pcapslice: cannot open {args.input}: {e}")
+            return 1
+        try:
+            return info_pcap(fh, args.utc)
+        except ValueError as e:
+            eprint(f"pcapslice: {e}")
+            return 1
+        finally:
+            fh.close()
+
+    if args.output is None and sys.stdout.isatty():
+        eprint(
+            "pcapslice: refusing to write binary pcap to a terminal; "
+            "redirect with > target.pcap or use -o FILE"
+        )
+        return 2
+
+    try:
+        fh = open_maybe_gz(args.input)
+    except OSError as e:
+        eprint(f"pcapslice: cannot open {args.input}: {e}")
+        return 1
+
+    out = open(args.output, "wb") if args.output else sys.stdout.buffer
+    try:
+        matched, total = slice_pcap(fh, out, start, end)
+    except ValueError as e:
+        eprint(f"pcapslice: {e}")
+        return 1
+    finally:
+        fh.close()
+        if args.output:
+            out.close()
+
+    zone = "UTC" if args.utc else "local"
+    eprint(
+        f"pcapslice: {matched}/{total} packets in "
+        f"[{time.strftime('%y%m%d_%H%M%S', (time.gmtime if args.utc else time.localtime)(start))}, "
+        f"{time.strftime('%y%m%d_%H%M%S', (time.gmtime if args.utc else time.localtime)(end))}] ({zone})"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
