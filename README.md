@@ -22,6 +22,7 @@ ln -s "$PWD/bin/pcapslice" ~/.local/bin/pcapslice
 | Tool | What it does |
 |------|--------------|
 | [`pcapslice`](bin/pcapslice) | Extract packets from a pcap/pcap.gz within a time window; also `-i` to report a capture's time span. Pure Python 3 stdlib, no deps. |
+| [`logless`](bin/logless) | A less-like pager for very large logs. Binary-searches to a timestamp (`J YYYY-MM-DD hhmmss`) and does less-style `/` `?` `n` `N` search, all mmap-backed so it never reads the file into memory. Pure Python 3 stdlib (curses). |
 
 ## Conventions
 

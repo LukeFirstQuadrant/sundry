@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+logless — a less-like pager for very large log files, with time jumping.
+
+Loads huge logs without reading them into memory (mmap + on-the-fly line
+navigation), and can binary-search straight to a timestamp. Built for logs
+whose lines begin with a timestamp, either bracketed or bare ISO, e.g.
+
+    [2026-07-07 16:46:19.830056] [INFO] watchdog: time_since_last_ping=...
+    2026-04-02T17:53:20 something happened
+
+Usage:
+    logless FILE
+    logless -t '2026-07-07 16:46:19' FILE      # open jumped to that time
+
+Keys (a subset of less, plus J):
+    j / k, ↓ / ↑        down / up one line
+    Space / f / PgDn    forward one screen        b / PgUp   back one screen
+    d / u               forward / back half screen
+    g / G               top / bottom of file
+    ← / →               scroll left / right
+    /pat   ?pat         search forward / backward (regex; smartcase)
+    n / N               repeat last search  / in the opposite direction
+    J                   jump to time: prompt for 'YYYY-MM-DD hhmmss'
+    h                   help          q          quit
+
+Time jump accepts flexible input, e.g.
+    2026-07-07 16:46:19.830056   2026-07-07 164619   2026-07-07 16:46   2026-07-07
+
+Pure Python 3 stdlib (uses curses; POSIX terminals only). No dependencies.
+"""
+
+import argparse
+import curses
+import datetime
+import mmap
+import os
+import re
+import sys
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+# --- timestamp handling ----------------------------------------------------
+
+# Timestamp at the very start of a line. Handles both the bracketed form
+#   [2026-07-07 16:46:19.830056] ...
+# and the bare ISO form
+#   2026-04-02T17:53:20 ...
+# The date/time separator may be a space or 'T', brackets are optional, and
+# fractional seconds are optional.
+TS_RE = re.compile(
+    rb"^\[?(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\]?"
+)
+
+
+def parse_line_ts(line):
+    """Return a datetime for a log line, or None if it has no leading stamp."""
+    m = TS_RE.match(line)
+    if not m:
+        return None
+    y, mo, d, h, mi, s = (int(m.group(i)) for i in range(1, 7))
+    frac = m.group(7)
+    us = int(frac[:6].ljust(6, b"0")) if frac else 0
+    try:
+        return datetime.datetime(y, mo, d, h, mi, s, us)
+    except ValueError:
+        return None
+
+
+def parse_target_time(text):
+    """Parse a user-typed time into a datetime; raise ValueError on garbage.
+
+    Accepts a date (YYYY-MM-DD or YYYY/MM/DD) optionally followed by a time
+    given as HH[:MM[:SS[.ffffff]]] or the colon-free HH / HHMM / HHMMSS.
+    Missing lower fields default to zero (start of the interval).
+    """
+    text = text.strip()
+    # split date from time on whitespace or an ISO 'T' separator
+    parts = re.split(r"[ T]+", text, maxsplit=1)
+    dpart = parts[0]
+    tpart = parts[1] if len(parts) > 1 else ""
+
+    dm = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", dpart)
+    if not dm:
+        raise ValueError("date must look like YYYY-MM-DD")
+    year, month, day = (int(x) for x in dm.groups())
+
+    hh = mi = ss = us = 0
+    if tpart:
+        if ":" in tpart:
+            tm = re.fullmatch(r"(\d{1,2})(?::(\d{1,2})(?::(\d{1,2})(?:\.(\d+))?)?)?", tpart)
+            if not tm:
+                raise ValueError("time must look like HH:MM:SS")
+            hh = int(tm.group(1))
+            mi = int(tm.group(2) or 0)
+            ss = int(tm.group(3) or 0)
+            frac = tm.group(4)
+            us = int(frac[:6].ljust(6, "0")) if frac else 0
+        else:
+            tm = re.fullmatch(r"(\d{2})(\d{2})?(\d{2})?(?:\.(\d+))?", tpart)
+            if not tm:
+                raise ValueError("time must be HH, HHMM, or HHMMSS")
+            hh = int(tm.group(1))
+            mi = int(tm.group(2) or 0)
+            ss = int(tm.group(3) or 0)
+            frac = tm.group(4)
+            us = int(frac[:6].ljust(6, "0")) if frac else 0
+    try:
+        return datetime.datetime(year, month, day, hh, mi, ss, us)
+    except ValueError as e:
+        raise ValueError(str(e))
+
+
+# --- pager -----------------------------------------------------------------
+
+TABSIZE = 8
+
+
+class Pager:
+    def __init__(self, buf, size, name):
+        self.buf = buf
+        self.size = size
+        self.name = name
+        self.top = 0            # byte offset of the first visible line
+        self.left = 0           # horizontal scroll (display columns)
+        self.msg = ""
+        self.height = 1         # content rows (recomputed each redraw)
+        self.width = 1
+        # search state
+        self.pat_b = None       # compiled bytes pattern (file navigation)
+        self.pat_s = None       # compiled str pattern (on-screen highlight)
+        self.search_fwd = True
+
+    # -- line geometry (all offsets are byte positions) --
+
+    def line_start(self, pos):
+        if pos <= 0:
+            return 0
+        nl = self.buf.rfind(b"\n", 0, pos)
+        return 0 if nl == -1 else nl + 1
+
+    def line_end(self, start):
+        nl = self.buf.find(b"\n", start)
+        return self.size if nl == -1 else nl
+
+    def next_line_start(self, start):
+        e = self.line_end(start)
+        return self.size if e >= self.size else e + 1
+
+    def prev_line_start(self, start):
+        if start <= 0:
+            return 0
+        nl = self.buf.rfind(b"\n", 0, start - 1)
+        return 0 if nl == -1 else nl + 1
+
+    def line_text(self, start):
+        return self.buf[start:self.line_end(start)]
+
+    def last_top(self):
+        """Top offset that puts the final line at the bottom of the screen."""
+        if self.size == 0:
+            return 0
+        off = self.line_start(self.size - 1)
+        for _ in range(self.height - 1):
+            if off == 0:
+                break
+            off = self.prev_line_start(off)
+        return off
+
+    def clamp(self):
+        self.top = max(0, min(self.top, self.last_top()))
+        if self.left < 0:
+            self.left = 0
+
+    # -- timestamp binary search --
+
+    def ts_of_pos(self, pos):
+        """Timestamp governing byte pos = nearest stamp at or before it."""
+        ls = self.line_start(pos)
+        while True:
+            ts = parse_line_ts(self.line_text(ls))
+            if ts is not None:
+                return ts
+            if ls == 0:
+                return None
+            ls = self.prev_line_start(ls)
+
+    def jump_to_time(self, target):
+        """Move to the first log entry whose timestamp is >= target."""
+        lo, hi = 0, self.size
+        while lo < hi:
+            mid = (lo + hi) // 2
+            ts = self.ts_of_pos(mid)
+            if ts is None or ts < target:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo >= self.size:
+            self.top = self.last_top()
+            self.msg = "(no entry at or after that time — at end)"
+        else:
+            self.top = self.line_start(lo)
+            self.clamp()
+            self.msg = f"jumped to {self.ts_of_pos(self.top)}"
+
+    # -- searching --
+
+    def set_pattern(self, text):
+        flags = re.IGNORECASE if text == text.lower() else 0
+        try:
+            self.pat_b = re.compile(text.encode(), flags)
+            self.pat_s = re.compile(text, flags)
+        except re.error:
+            # fall back to a literal match on invalid regex
+            self.pat_b = re.compile(re.escape(text.encode()), flags)
+            self.pat_s = re.compile(re.escape(text), flags)
+
+    def _find_forward(self, from_pos):
+        m = self.pat_b.search(self.buf, from_pos)
+        return m.start() if m else None
+
+    def _find_backward(self, before_pos):
+        WIN = 1 << 20
+        OVER = 1 << 16
+        end = before_pos
+        while end > 0:
+            start = max(0, end - WIN)
+            last = None
+            for m in self.pat_b.finditer(self.buf, start, min(end + OVER, before_pos)):
+                if m.start() < before_pos:
+                    last = m
+            if last is not None:
+                return last.start()
+            end = start
+        return None
+
+    def do_search(self, forward):
+        if self.pat_b is None:
+            self.msg = "no previous search"
+            return
+        if forward:
+            hit = self._find_forward(self.next_line_start(self.top))
+        else:
+            hit = self._find_backward(self.top)
+        if hit is None:
+            self.msg = "pattern not found"
+        else:
+            self.top = self.line_start(hit)
+            self.clamp()
+            self.msg = ""
+
+    # -- rendering --
+
+    def render(self, stdscr):
+        maxy, maxx = stdscr.getmaxyx()
+        self.height = max(1, maxy - 1)
+        self.width = max(1, maxx)
+        stdscr.erase()
+
+        off = self.top
+        for row in range(self.height):
+            if off >= self.size:
+                break
+            disp = self.line_text(off).decode("utf-8", "replace").expandtabs(TABSIZE)
+            visible = disp[self.left:self.left + self.width]
+            try:
+                stdscr.addnstr(row, 0, visible, self.width)
+            except curses.error:
+                pass
+            if self.pat_s is not None and visible:
+                for m in self.pat_s.finditer(disp):
+                    a = max(m.start() - self.left, 0)
+                    b = min(m.end() - self.left, self.width)
+                    if b > a:
+                        try:
+                            stdscr.addnstr(row, a, disp[m.start():m.end()][:b - a],
+                                           b - a, curses.A_REVERSE)
+                        except curses.error:
+                            pass
+            off = self.next_line_start(off)
+
+        self._draw_status(stdscr, maxy, maxx)
+        stdscr.refresh()
+
+    def _draw_status(self, stdscr, maxy, maxx):
+        pct = int(self.top * 100 / self.size) if self.size else 100
+        at_end = self.top >= self.last_top()
+        where = "END" if at_end and self.size else f"{pct}%"
+        left = f" {self.name}  {where}  byte {self.top}/{self.size}"
+        right = self.msg
+        bar = left
+        if right:
+            pad = maxx - len(left) - len(right) - 1
+            bar = left + (" " * pad if pad > 0 else "  ") + right
+        try:
+            stdscr.addnstr(maxy - 1, 0, bar.ljust(maxx - 1), maxx - 1, curses.A_REVERSE)
+        except curses.error:
+            pass
+
+    # -- bottom-line prompt --
+
+    def prompt(self, stdscr, label):
+        maxy, maxx = stdscr.getmaxyx()
+        buf = ""
+        curses.curs_set(1)
+        try:
+            while True:
+                shown = (label + buf)[-(maxx - 1):]
+                try:
+                    stdscr.addnstr(maxy - 1, 0, shown.ljust(maxx - 1), maxx - 1)
+                    stdscr.move(maxy - 1, min(len(label) + len(buf), maxx - 1))
+                except curses.error:
+                    pass
+                stdscr.refresh()
+                ch = stdscr.getch()
+                if ch in (10, 13, curses.KEY_ENTER):
+                    return buf
+                if ch == 27:                       # ESC cancels
+                    return None
+                if ch in (curses.KEY_BACKSPACE, 127, 8):
+                    buf = buf[:-1]
+                elif 32 <= ch < 127:
+                    buf += chr(ch)
+        finally:
+            curses.curs_set(0)
+
+    def show_help(self, stdscr):
+        lines = __doc__.strip().splitlines()
+        stdscr.erase()
+        maxy, maxx = stdscr.getmaxyx()
+        for i, ln in enumerate(lines[:maxy - 1]):
+            try:
+                stdscr.addnstr(i, 0, ln, maxx - 1)
+            except curses.error:
+                pass
+        try:
+            stdscr.addnstr(maxy - 1, 0, " -- press any key --".ljust(maxx - 1),
+                           maxx - 1, curses.A_REVERSE)
+        except curses.error:
+            pass
+        stdscr.refresh()
+        stdscr.getch()
+
+    # -- main loop --
+
+    def run(self, stdscr, start_time=None):
+        curses.curs_set(0)
+        stdscr.keypad(True)
+
+        if self.size == 0:
+            stdscr.erase()
+            stdscr.addstr(0, 0, f"{self.name}: (empty file) — press q to quit")
+            stdscr.refresh()
+            while stdscr.getch() not in (ord("q"), ord("Q")):
+                pass
+            return
+
+        if start_time is not None:
+            self.jump_to_time(start_time)
+
+        while True:
+            self.render(stdscr)
+            ch = stdscr.getch()
+            self.msg = ""
+            h = self.height
+
+            if ch in (ord("q"), ord("Q")):
+                return
+            elif ch in (ord("j"), curses.KEY_DOWN, 10, 13, curses.KEY_ENTER):
+                self.top = self.next_line_start(self.top)
+            elif ch in (ord("k"), curses.KEY_UP):
+                self.top = self.prev_line_start(self.top)
+            elif ch in (ord(" "), ord("f"), curses.KEY_NPAGE):
+                for _ in range(h):
+                    self.top = self.next_line_start(self.top)
+            elif ch in (ord("b"), curses.KEY_PPAGE):
+                for _ in range(h):
+                    self.top = self.prev_line_start(self.top)
+            elif ch == ord("d"):
+                for _ in range(h // 2):
+                    self.top = self.next_line_start(self.top)
+            elif ch == ord("u"):
+                for _ in range(h // 2):
+                    self.top = self.prev_line_start(self.top)
+            elif ch in (ord("g"), curses.KEY_HOME):
+                self.top = 0
+            elif ch in (ord("G"), curses.KEY_END):
+                self.top = self.last_top()
+            elif ch in (curses.KEY_LEFT,):
+                self.left -= TABSIZE
+            elif ch in (curses.KEY_RIGHT,):
+                self.left += TABSIZE
+            elif ch == ord("/"):
+                text = self.prompt(stdscr, "/")
+                if text:
+                    self.set_pattern(text)
+                    self.search_fwd = True
+                    self.do_search(True)
+            elif ch == ord("?"):
+                text = self.prompt(stdscr, "?")
+                if text:
+                    self.set_pattern(text)
+                    self.search_fwd = False
+                    self.do_search(False)
+            elif ch == ord("n"):
+                self.do_search(self.search_fwd)
+            elif ch == ord("N"):
+                self.do_search(not self.search_fwd)
+            elif ch in (ord("J"), ord("T")):
+                text = self.prompt(stdscr, "Jump to time: ")
+                if text:
+                    try:
+                        self.jump_to_time(parse_target_time(text))
+                    except ValueError as e:
+                        self.msg = f"bad time: {e}"
+            elif ch in (ord("h"), ord("H")):
+                self.show_help(stdscr)
+            elif ch == curses.KEY_RESIZE:
+                pass  # dimensions are recomputed on the next render
+
+            self.clamp()
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="logless",
+        description="A less-like pager for very large logs, with time jumping.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("file", help="log file to view")
+    p.add_argument(
+        "-t",
+        "--time",
+        help="open positioned at the first entry >= this time "
+        "(e.g. '2026-07-07 16:46:19')",
+    )
+    args = p.parse_args(argv)
+
+    if args.file.endswith(".gz"):
+        eprint("logless: gzip files aren't seekable; decompress first "
+               "(e.g.  gunzip -k file.gz  or  zcat file.gz > file.log)")
+        return 2
+    if not os.path.exists(args.file):
+        eprint(f"logless: {args.file}: no such file")
+        return 2
+    if os.path.isdir(args.file):
+        eprint(f"logless: {args.file}: is a directory")
+        return 2
+
+    start_time = None
+    if args.time:
+        try:
+            start_time = parse_target_time(args.time)
+        except ValueError as e:
+            eprint(f"logless: bad -t/--time: {e}")
+            return 2
+
+    fd = os.open(args.file, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        if size == 0:
+            buf = b""
+        else:
+            buf = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+        pager = Pager(buf, size, os.path.basename(args.file))
+        try:
+            curses.wrapper(pager.run, start_time)
+        finally:
+            if size:
+                buf.close()
+    finally:
+        os.close(fd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
