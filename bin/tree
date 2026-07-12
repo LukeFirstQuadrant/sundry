@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# 递归打印目录树
+print_tree() {
+    local prefix="$1"      # 当前缩进前缀
+    local dir="$2"         # 要列出的目录
+    local items=("$dir"/*) # 获取所有非隐藏文件/目录
+
+    local count=${#items[@]}
+    for i in "${!items[@]}"; do
+        local item="${items[$i]}"
+        local base=$(basename "$item")
+        local new_prefix="$prefix"
+
+        # 判断是否为最后一个元素，决定连接符
+        if [ $((i + 1)) -eq $count ]; then
+            echo "${prefix}└── $base"
+            new_prefix="${prefix}    "
+        else
+            echo "${prefix}├── $base"
+            new_prefix="${prefix}│   "
+        fi
+
+        # 如果是目录，递归进入
+        if [ -d "$item" ]; then
+            print_tree "$new_prefix" "$item"
+        fi
+    done
+}
+
+# 如果未传参数，默认当前目录
+target="${1:-.}"
+echo "$target"
+print_tree "" "$target"
